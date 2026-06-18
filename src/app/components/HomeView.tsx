@@ -2,64 +2,102 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { Phone, PhoneOff, Bell, Wifi, Shield } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import DailyIframe, { DailyCall } from "@daily-co/daily-js";
+import { getOrCreateRoom } from "../services/daily";
 
-type CallState = "idle" | "ringing" | "active" | "ended";
-const STORAGE_KEY = "doorbell_signal";
+type CallState = "idle" | "ringing" | "active";
 
 export function HomeView() {
   const [callState, setCallState] = useState<CallState>("idle");
   const [callDuration, setCallDuration] = useState(0);
-  const [myStream, setMyStream] = useState<MediaStream | null>(null);
-  const [visitorStream, setVisitorStream] = useState<MediaStream | null>(null);
   const [currentTime, setCurrentTime] = useState(new Date());
+  const [roomUrl, setRoomUrl] = useState("");
+  const [visitorName, setVisitorName] = useState("Visitante");
 
+  const callRef = useRef<DailyCall | null>(null);
   const myVideoRef = useRef<HTMLVideoElement>(null);
   const visitorVideoRef = useRef<HTMLVideoElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const visitorUrl = typeof window !== "undefined"
     ? `${window.location.origin}${window.location.pathname.replace(/\/$/, "")}#/visit`
-    : "https://example.com/visit";
+    : "";
 
   useEffect(() => {
     const tick = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(tick);
   }, []);
 
-  const endCall = useCallback((notify = true) => {
-    if (notify) localStorage.setItem(STORAGE_KEY, "ended");
+  useEffect(() => {
+    getOrCreateRoom().then(setRoomUrl).catch(console.error);
+  }, []);
+
+  const updateVideoTracks = useCallback((call: DailyCall) => {
+    const participants = call.participants();
+    // Local (homeowner)
+    const local = participants.local;
+    if (local?.tracks?.video?.persistentTrack && myVideoRef.current) {
+      myVideoRef.current.srcObject = new MediaStream([local.tracks.video.persistentTrack]);
+    }
+    // Remote (visitor)
+    const remoteIds = Object.keys(participants).filter((id) => id !== "local");
+    if (remoteIds.length > 0) {
+      const remote = participants[remoteIds[0]];
+      if (remote?.tracks?.video?.persistentTrack && visitorVideoRef.current) {
+        visitorVideoRef.current.srcObject = new MediaStream([remote.tracks.video.persistentTrack]);
+      }
+    }
+  }, []);
+
+  const endCall = useCallback(() => {
+    if (callRef.current) {
+      callRef.current.leave();
+      callRef.current.destroy();
+      callRef.current = null;
+    }
+    if (timerRef.current) clearInterval(timerRef.current);
     setCallState("idle");
     setCallDuration(0);
-    if (timerRef.current) clearInterval(timerRef.current);
-    if (myStream) { myStream.getTracks().forEach((t) => t.stop()); setMyStream(null); }
-    if (visitorStream) { visitorStream.getTracks().forEach((t) => t.stop()); setVisitorStream(null); }
-  }, [myStream, visitorStream]);
+  }, []);
 
-  const handleStorageEvent = useCallback((e: StorageEvent) => {
-    if (e.key !== STORAGE_KEY) return;
-    if (e.newValue === "calling") setCallState("ringing");
-    else if (e.newValue === "ended") endCall(false);
-  }, [endCall]);
-
+  // Join room silently to monitor for visitors
   useEffect(() => {
-    window.addEventListener("storage", handleStorageEvent);
-    return () => window.removeEventListener("storage", handleStorageEvent);
-  }, [handleStorageEvent]);
+    if (!roomUrl) return;
+
+    const call = DailyIframe.createCallObject({ audioSource: false, videoSource: false });
+    callRef.current = call;
+
+    call.join({ url: roomUrl, userName: "Morador" }).catch(console.error);
+
+    call.on("participant-joined", (event) => {
+      if (event?.participant?.local) return;
+      setVisitorName(event?.participant?.user_name || "Visitante");
+      setCallState("ringing");
+    });
+
+    call.on("participant-left", () => {
+      const remotes = Object.keys(call.participants()).filter((id) => id !== "local");
+      if (remotes.length === 0) endCall();
+    });
+
+    call.on("track-started", () => updateVideoTracks(call));
+
+    return () => {
+      call.leave().then(() => call.destroy());
+    };
+  }, [roomUrl, endCall, updateVideoTracks]);
 
   const answer = async () => {
+    if (!callRef.current) return;
     setCallState("active");
-    localStorage.setItem(STORAGE_KEY, "answered");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      setMyStream(stream);
-      if (myVideoRef.current) myVideoRef.current.srcObject = stream;
-    } catch {}
+    await callRef.current.setLocalAudio(true);
+    await callRef.current.setLocalVideo(true);
+    updateVideoTracks(callRef.current);
     timerRef.current = setInterval(() => setCallDuration((d) => d + 1), 1000);
   };
 
   const decline = () => {
-    localStorage.setItem(STORAGE_KEY, "declined");
-    endCall(false);
+    endCall();
   };
 
   const formatDuration = (s: number) =>
@@ -80,8 +118,8 @@ export function HomeView() {
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5">
-            <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-            <span className="text-xs" style={{ color: "#6b90a8" }}>Online</span>
+            <div className={`w-2 h-2 rounded-full ${roomUrl ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
+            <span className="text-xs" style={{ color: "#6b90a8" }}>{roomUrl ? "Online" : "Conectando..."}</span>
           </div>
           <div className="flex items-center gap-1.5" style={{ color: "#6b90a8" }}>
             <Wifi size={14} /><Shield size={14} />
@@ -90,29 +128,40 @@ export function HomeView() {
       </header>
 
       <div className="flex flex-1 gap-6 p-6 max-w-6xl mx-auto w-full">
+        {/* Left panel */}
         <div className="flex flex-col gap-5 w-72 shrink-0">
           <div className="rounded-2xl p-5 border border-border" style={{ background: "rgba(12,26,46,0.8)" }}>
             <div className="text-4xl tabular-nums mb-1" style={{ color: "#00d4ff", fontFamily: "monospace" }}>{formatTime(currentTime)}</div>
             <div className="text-sm capitalize" style={{ color: "#6b90a8" }}>{formatDate(currentTime)}</div>
           </div>
+
           <div className="rounded-2xl p-5 border border-border" style={{ background: "rgba(12,26,46,0.8)" }}>
             <div className="text-xs uppercase tracking-widest mb-4" style={{ color: "#6b90a8" }}>QR Code da Porta</div>
             <div className="flex justify-center mb-4">
               <div className="p-3 rounded-xl" style={{ background: "#ffffff" }}>
-                <QRCodeSVG value={visitorUrl} size={160} bgColor="#ffffff" fgColor="#07111f" level="H" />
+                {visitorUrl ? (
+                  <QRCodeSVG value={visitorUrl} size={160} bgColor="#ffffff" fgColor="#07111f" level="H" />
+                ) : (
+                  <div className="w-40 h-40 flex items-center justify-center" style={{ color: "#6b90a8" }}>Carregando...</div>
+                )}
               </div>
             </div>
             <p className="text-xs text-center leading-relaxed" style={{ color: "#6b90a8" }}>
-              Cole este QR code na sua porta. Visitantes escaneiam e a videochamada inicia automaticamente.
+              Visitantes escaneiam este código e a videochamada inicia automaticamente.
             </p>
             <div className="mt-3 p-2 rounded-lg text-xs text-center break-all" style={{ background: "rgba(0,212,255,0.06)", color: "#6b90a8", fontFamily: "monospace" }}>
               {visitorUrl}
             </div>
           </div>
+
           <div className="rounded-2xl p-5 border border-border" style={{ background: "rgba(12,26,46,0.8)" }}>
-            <div className="text-xs uppercase tracking-widest mb-3" style={{ color: "#6b90a8" }}>Atividade</div>
+            <div className="text-xs uppercase tracking-widest mb-3" style={{ color: "#6b90a8" }}>Status</div>
             <div className="space-y-3">
-              {[{ label: "Visitas hoje", value: "3" }, { label: "Última visita", value: "14:22" }, { label: "Câmera", value: "Ativa" }].map((item) => (
+              {[
+                { label: "Sala", value: roomUrl ? "Ativa" : "Criando..." },
+                { label: "Protocolo", value: "WebRTC" },
+                { label: "Criptografia", value: "E2E" },
+              ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between">
                   <span className="text-sm" style={{ color: "#6b90a8" }}>{item.label}</span>
                   <span className="text-sm" style={{ color: "#dff0f7" }}>{item.value}</span>
@@ -122,6 +171,7 @@ export function HomeView() {
           </div>
         </div>
 
+        {/* Main panel */}
         <div className="flex-1 flex flex-col">
           <AnimatePresence mode="wait">
             {callState === "idle" && (
@@ -134,7 +184,7 @@ export function HomeView() {
                 <p className="text-sm" style={{ color: "#6b90a8" }}>Quando alguém escanear o QR code, você receberá a chamada aqui.</p>
                 <div className="mt-8 flex items-center gap-2 px-4 py-2 rounded-full" style={{ background: "rgba(0,212,255,0.08)", border: "1px solid rgba(0,212,255,0.15)" }}>
                   <div className="w-2 h-2 rounded-full bg-green-400" />
-                  <span className="text-sm" style={{ color: "#6b90a8" }}>Sistema ativo e monitorando</span>
+                  <span className="text-sm" style={{ color: "#6b90a8" }}>Sistema ativo — chamadas via Daily.co</span>
                 </div>
               </motion.div>
             )}
@@ -153,7 +203,7 @@ export function HomeView() {
                   </div>
                 </div>
                 <h2 className="mb-1" style={{ color: "#dff0f7" }}>Chamada recebida</h2>
-                <p className="text-sm mb-10" style={{ color: "#6b90a8" }}>Visitante na porta...</p>
+                <p className="text-sm mb-10" style={{ color: "#6b90a8" }}>{visitorName} está na porta</p>
                 <div className="flex items-center gap-6">
                   <button onClick={decline} className="w-16 h-16 rounded-full flex items-center justify-center transition-all hover:scale-105"
                     style={{ background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", color: "#ef4444" }}>
@@ -172,17 +222,9 @@ export function HomeView() {
 
             {callState === "active" && (
               <motion.div key="active" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-                className="flex-1 flex flex-col rounded-2xl overflow-hidden border border-border relative">
+                className="flex-1 flex flex-col rounded-2xl overflow-hidden border border-border">
                 <div className="flex-1 relative flex items-center justify-center" style={{ background: "#000d1a" }}>
-                  <video ref={visitorVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" style={{ display: visitorStream ? "block" : "none" }} />
-                  {!visitorStream && (
-                    <div className="flex flex-col items-center gap-3">
-                      <div className="w-16 h-16 rounded-full flex items-center justify-center" style={{ background: "rgba(0,212,255,0.1)", border: "1px solid rgba(0,212,255,0.3)" }}>
-                        <Phone size={24} style={{ color: "#00d4ff" }} />
-                      </div>
-                      <p className="text-sm" style={{ color: "#6b90a8" }}>Câmera do visitante conectada</p>
-                    </div>
-                  )}
+                  <video ref={visitorVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
                   <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full" style={{ background: "rgba(7,17,31,0.8)", border: "1px solid rgba(0,212,255,0.2)" }}>
                     <div className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
                     <span className="text-sm tabular-nums" style={{ color: "#dff0f7", fontFamily: "monospace" }}>{formatDuration(callDuration)}</span>
@@ -193,7 +235,7 @@ export function HomeView() {
                   </div>
                 </div>
                 <div className="flex items-center justify-center gap-4 py-4 border-t border-border" style={{ background: "rgba(12,26,46,0.9)" }}>
-                  <button onClick={() => endCall(true)} className="flex items-center gap-2 px-6 py-3 rounded-full transition-all hover:scale-105"
+                  <button onClick={endCall} className="flex items-center gap-2 px-6 py-3 rounded-full transition-all hover:scale-105"
                     style={{ background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", color: "#ef4444" }}>
                     <PhoneOff size={18} /><span>Encerrar</span>
                   </button>
